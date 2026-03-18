@@ -617,3 +617,433 @@ class TestRawEndpoint:
         response = TestClient(app).post("/api/raw", json={"model": "mistral:latest"})
 
         assert response.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# POST /api/chat — skip_routing mode (Human-in-the-Loop Continue path)
+# ---------------------------------------------------------------------------
+
+
+class TestSkipRoutingMode:
+    """Tests for POST /api/chat with skip_routing=True."""
+
+    _payload = {
+        "model": "llama3:latest",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "skip_routing": True,
+    }
+
+    def test_skip_routing_streams_tokens_directly(self):
+        """skip_routing bypasses the interceptor and streams tokens via _token_stream."""
+        app.dependency_overrides[get_ollama_client] = lambda: MockChatClient()
+        response = TestClient(app).post("/api/chat", json=self._payload)
+
+        assert response.status_code == 200
+        tokens = _parse_token_events(response.text)
+        assert tokens == ["Hello", ", ", "world!"]
+
+    def test_skip_routing_ends_with_done(self):
+        """skip_routing stream must terminate with [DONE]."""
+        app.dependency_overrides[get_ollama_client] = lambda: MockChatClient()
+        response = TestClient(app).post("/api/chat", json=self._payload)
+        assert _has_done_event(response.text)
+
+    def test_skip_routing_emits_error_on_http_400(self):
+        """HTTP 400 in skip_routing path must emit friendly SSE error event."""
+        app.dependency_overrides[get_ollama_client] = lambda: Http400ChatClient()
+        response = TestClient(app).post("/api/chat", json=self._payload)
+
+        assert response.status_code == 200
+        assert _has_error_event(response.text)
+
+    def test_skip_routing_emits_error_on_http_non400(self):
+        """HTTP 503 in skip_routing path must emit a generic SSE error event."""
+
+        class Http503ChatClient:
+            async def list_models(self):
+                return []
+
+            async def chat(self, model, messages):
+                request = httpx.Request("POST", "http://localhost:11434/api/chat")
+                response = httpx.Response(503, text="Service unavailable", request=request)
+                raise httpx.HTTPStatusError("503", request=request, response=response)
+                yield
+
+        app.dependency_overrides[get_ollama_client] = lambda: Http503ChatClient()
+        response = TestClient(app).post("/api/chat", json=self._payload)
+
+        assert response.status_code == 200
+        assert _has_error_event(response.text)
+
+    def test_skip_routing_emits_error_on_generic_exception(self):
+        """Generic exceptions in skip_routing path must emit SSE error event."""
+        app.dependency_overrides[get_ollama_client] = lambda: ErrorChatClient()
+        response = TestClient(app).post("/api/chat", json=self._payload)
+
+        assert response.status_code == 200
+        assert _has_error_event(response.text)
+
+
+# ---------------------------------------------------------------------------
+# Meta-agent edge cases — additional branch coverage
+# ---------------------------------------------------------------------------
+
+
+class TestMetaAgentEdgeCases:
+    """Additional branch coverage for _meta_agent_interceptor."""
+
+    _payload = {
+        "model": "llama3:latest",
+        "messages": [{"role": "user", "content": "Hello"}],
+    }
+
+    def test_list_models_exception_falls_back_to_empty(self):
+        """If list_models() raises, the endpoint must still work with no system context."""
+
+        class FailingListClient(MockChatClient):
+            async def list_models(self):
+                raise Exception("Ollama offline")
+
+        app.dependency_overrides[get_ollama_client] = lambda: FailingListClient()
+        response = TestClient(app).post("/api/chat", json=self._payload)
+
+        assert response.status_code == 200
+        assert _has_done_event(response.text)
+
+    def test_plain_text_no_brace_flushed(self):
+        """Tokens with no '{' must be flushed immediately as text tokens."""
+
+        class PlainTextClient(MockChatClient):
+            async def chat(self, model, messages):
+                yield "Hello world no braces here"
+
+        app.dependency_overrides[get_ollama_client] = lambda: PlainTextClient()
+        response = TestClient(app).post("/api/chat", json=self._payload)
+
+        tokens = _parse_token_events(response.text)
+        assert "Hello world no braces here" in "".join(tokens)
+
+    def test_brace_not_followed_by_quote_flushed_as_text(self):
+        """A '{' followed by a non-'"' character must be flushed as plain text."""
+
+        class BraceNoQuoteClient(MockChatClient):
+            async def chat(self, model, messages):
+                yield "{ not a json key }"
+
+        app.dependency_overrides[get_ollama_client] = lambda: BraceNoQuoteClient()
+        response = TestClient(app).post("/api/chat", json=self._payload)
+
+        tokens = _parse_token_events(response.text)
+        assert "{" in "".join(tokens)
+
+    def test_normal_json_without_action_flushed_as_token(self):
+        """A JSON object without an 'action' key must be flushed as a text token."""
+
+        class NoActionJsonClient(MockChatClient):
+            async def chat(self, model, messages):
+                yield '{"result": 42}'
+
+        app.dependency_overrides[get_ollama_client] = lambda: NoActionJsonClient()
+        response = TestClient(app).post("/api/chat", json=self._payload)
+
+        tokens = _parse_token_events(response.text)
+        full = "".join(tokens)
+        assert '"result"' in full
+
+    def test_buffer_overflow_flushed_as_text(self):
+        """If the buffer grows beyond _CONSULT_BUFFER_LIMIT without a valid JSON object,
+        it must be flushed as plain text tokens."""
+
+        class OverflowClient(MockChatClient):
+            async def chat(self, model, messages):
+                # Start a JSON-looking sequence but never close it.
+                yield '{"action": "consult"' + " " * 2_100  # exceeds 2000 char limit
+
+        app.dependency_overrides[get_ollama_client] = lambda: OverflowClient()
+        response = TestClient(app).post("/api/chat", json=self._payload)
+
+        assert response.status_code == 200
+        assert _has_done_event(response.text)
+
+    def test_consult_missing_target_model(self):
+        """consult JSON missing target_model must re-prompt the primary model."""
+
+        class MissingTargetClient:
+            def __init__(self):
+                self._call = 0
+
+            async def list_models(self):
+                return [{"name": "expert:latest", "details": {}}]
+
+            async def chat(self, model, messages):
+                self._call += 1
+                if self._call == 1:
+                    yield '{"action": "consult", "prompt": "no target here"}'
+                else:
+                    yield "Direct answer."
+
+            async def generate(self, model, prompt):
+                yield "Expert text"
+                return
+                yield
+
+        app.dependency_overrides[get_ollama_client] = lambda: MissingTargetClient()
+        response = TestClient(app).post("/api/chat", json=self._payload)
+
+        assert response.status_code == 200
+        tokens = _parse_token_events(response.text)
+        assert "Direct answer." in "".join(tokens)
+
+    def test_consult_invalid_target_model_triggers_recommendation(self):
+        """consult with a target not in installed list emits a recommendation event."""
+
+        class InvalidTargetClient:
+            async def list_models(self):
+                return [{"name": "installed-model:latest", "details": {}}]
+
+            async def chat(self, model, messages):
+                yield '{"action": "consult", "target_model": "ghost-model:7b", "prompt": "help"}'
+
+            async def generate(self, model, prompt):
+                return
+                yield
+
+        app.dependency_overrides[get_ollama_client] = lambda: InvalidTargetClient()
+        response = TestClient(app).post("/api/chat", json=self._payload)
+
+        status_events = _parse_status_events(response.text)
+        assert any(e.get("status") == "recommendation" for e in status_events)
+        assert _has_done_event(response.text)
+
+    def test_consult_expert_value_error(self):
+        """If the expert model raises ValueError, an SSE error event must be emitted."""
+
+        class ExpertValueErrorClient:
+            def __init__(self):
+                self._call = 0
+
+            async def list_models(self):
+                return [{"name": "codellama:latest", "details": {}}]
+
+            async def chat(self, model, messages):
+                self._call += 1
+                if self._call == 1:
+                    yield '{"action": "consult", "target_model": "codellama:latest", "prompt": "help"}'
+
+            async def generate(self, model, prompt):
+                raise ValueError("Model does not support generation")
+                yield
+
+        app.dependency_overrides[get_ollama_client] = lambda: ExpertValueErrorClient()
+        response = TestClient(app).post("/api/chat", json=self._payload)
+
+        assert _has_error_event(response.text)
+        assert _has_done_event(response.text)
+
+    def test_consult_expert_generic_error(self):
+        """If the expert model raises a generic Exception, an SSE error event must be emitted."""
+
+        class ExpertGenericErrorClient:
+            def __init__(self):
+                self._call = 0
+
+            async def list_models(self):
+                return [{"name": "codellama:latest", "details": {}}]
+
+            async def chat(self, model, messages):
+                self._call += 1
+                if self._call == 1:
+                    yield '{"action": "consult", "target_model": "codellama:latest", "prompt": "help"}'
+
+            async def generate(self, model, prompt):
+                raise Exception("Specialist process crashed")
+                yield
+
+        app.dependency_overrides[get_ollama_client] = lambda: ExpertGenericErrorClient()
+        response = TestClient(app).post("/api/chat", json=self._payload)
+
+        assert _has_error_event(response.text)
+        assert _has_done_event(response.text)
+
+    def test_recommend_install_without_target_model(self):
+        """recommend_install with no target_model key must emit an error event."""
+
+        class NoTargetRecommendClient:
+            async def list_models(self):
+                return []
+
+            async def chat(self, model, messages):
+                yield '{"action": "recommend_install", "reason": "Need a better model"}'
+
+            async def generate(self, model, prompt):
+                return
+                yield
+
+        app.dependency_overrides[get_ollama_client] = lambda: NoTargetRecommendClient()
+        response = TestClient(app).post("/api/chat", json=self._payload)
+
+        assert _has_error_event(response.text)
+        assert _has_done_event(response.text)
+
+    def test_http_400_in_meta_agent(self):
+        """HTTP 400 from Ollama's chat endpoint during meta-agent streaming emits friendly error."""
+
+        class MetaHttp400Client:
+            async def list_models(self):
+                return []
+
+            async def chat(self, model, messages):
+                request = httpx.Request("POST", "http://localhost:11434/api/chat")
+                response = httpx.Response(400, text="Bad", request=request)
+                raise httpx.HTTPStatusError("400", request=request, response=response)
+                yield
+
+        app.dependency_overrides[get_ollama_client] = lambda: MetaHttp400Client()
+        response = TestClient(app).post("/api/chat", json=self._payload)
+
+        assert response.status_code == 200
+        assert _has_error_event(response.text)
+
+    def test_http_non400_in_meta_agent(self):
+        """HTTP 503 from Ollama's chat during meta-agent must emit a generic error event."""
+
+        class MetaHttp503Client:
+            async def list_models(self):
+                return []
+
+            async def chat(self, model, messages):
+                request = httpx.Request("POST", "http://localhost:11434/api/chat")
+                response = httpx.Response(503, text="Unavailable", request=request)
+                raise httpx.HTTPStatusError("503", request=request, response=response)
+                yield
+
+        app.dependency_overrides[get_ollama_client] = lambda: MetaHttp503Client()
+        response = TestClient(app).post("/api/chat", json=self._payload)
+
+        assert response.status_code == 200
+        assert _has_error_event(response.text)
+
+    def test_generic_exception_in_meta_agent(self):
+        """Generic exception from Ollama's chat during meta-agent must emit an error event."""
+
+        class MetaGenericErrorClient:
+            async def list_models(self):
+                return []
+
+            async def chat(self, model, messages):
+                raise Exception("Unexpected process crash")
+                yield
+
+        app.dependency_overrides[get_ollama_client] = lambda: MetaGenericErrorClient()
+        response = TestClient(app).post("/api/chat", json=self._payload)
+
+        assert response.status_code == 200
+        assert _has_error_event(response.text)
+
+    def test_stream_reprompt_no_user_message_appends_error(self):
+        """If the last message is not a user message, re-prompt appends error as new user msg."""
+
+        class NoLastUserMsgClient:
+            def __init__(self):
+                self._call = 0
+
+            async def list_models(self):
+                return []
+
+            async def chat(self, model, messages):
+                self._call += 1
+                if self._call == 1:
+                    yield '{"action": "get_weather", "city": "London"}'
+                else:
+                    yield "Here is the answer."
+
+            async def generate(self, model, prompt):
+                return
+                yield
+
+        # Send a conversation where the last message is assistant (not user)
+        app.dependency_overrides[get_ollama_client] = lambda: NoLastUserMsgClient()
+        response = TestClient(app).post("/api/chat", json={
+            "model": "llama3:latest",
+            "messages": [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi there!"},
+            ],
+        })
+
+        assert response.status_code == 200
+        assert _has_done_event(response.text)
+
+    def test_residual_buffer_flushed_at_end(self):
+        """Residual buffer content that never forms a complete JSON block is flushed at stream end."""
+
+        class IncompleteJsonClient(MockChatClient):
+            async def chat(self, model, messages):
+                # Starts like JSON but never closes -- short enough to not trigger overflow
+                yield '{"unfinished": '
+
+        app.dependency_overrides[get_ollama_client] = lambda: IncompleteJsonClient()
+        response = TestClient(app).post("/api/chat", json=self._payload)
+
+        assert response.status_code == 200
+        assert _has_done_event(response.text)
+        tokens = _parse_token_events(response.text)
+        assert '{' in "".join(tokens)
+
+    def test_inject_system_context_skips_when_system_msg_present(self):
+        """If messages already start with a system role, the injected prompt must be skipped."""
+        from routers.chat import _inject_system_context
+
+        existing_system = [{"role": "system", "content": "My custom context"}, {"role": "user", "content": "Hi"}]
+        result = _inject_system_context(existing_system, "Generated context")
+        # Must return the original list unchanged
+        assert result[0]["content"] == "My custom context"
+        assert len(result) == 2
+
+    def test_inject_system_context_skips_when_no_prompt(self):
+        """An empty system_prompt must return the messages list unchanged."""
+        from routers.chat import _inject_system_context
+
+        messages = [{"role": "user", "content": "Hello"}]
+        result = _inject_system_context(messages, "")
+        assert result is messages
+
+    def test_build_system_context_with_no_models(self):
+        """_build_system_context with empty list must include 'No other models' line."""
+        from routers.chat import _build_system_context
+
+        result = _build_system_context([])
+        assert "No other models" in result
+
+    def test_build_system_context_with_models(self):
+        """_build_system_context with model list must include model names."""
+        from routers.chat import _build_system_context
+
+        models = [{"name": "codellama:latest", "details": {"family": "llama"}}]
+        result = _build_system_context(models)
+        assert "codellama:latest" in result
+
+    def test_raw_endpoint_http_non400_emits_generic_error(self):
+        """HTTP 503 in /api/raw must emit a generic error message (not the 400 one)."""
+
+        class Http503GenerateClient(MockChatClient):
+            async def generate(self, model, prompt):
+                request = httpx.Request("POST", "http://localhost:11434/api/generate")
+                response = httpx.Response(503, text="Service Down", request=request)
+                raise httpx.HTTPStatusError("503", request=request, response=response)
+                yield
+
+        app.dependency_overrides[get_ollama_client] = lambda: Http503GenerateClient()
+        response = TestClient(app).post("/api/raw", json={"model": "mistral:latest", "prompt": "test"})
+
+        assert response.status_code == 200
+        assert _has_error_event(response.text)
+        # The error message should NOT say embedding
+        for line in response.text.splitlines():
+            if line.startswith("data: ") and line != "data: [DONE]":
+                try:
+                    event = json.loads(line[6:])
+                    if "error" in event:
+                        assert "HTTP 503" in event["error"]
+                except Exception:
+                    pass

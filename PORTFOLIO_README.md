@@ -59,12 +59,18 @@ python run.py
 
 ## 🧪 Calidad de Código y TDD (Test-Driven Development)
 
-El backend de esta aplicación se diseñó y programó manteniendo el paradigma de **TDD**. La red de ruteo HTTP hacia la API de Ollama y sus casos borde (incluyendo intercepciones) se encuentran respaldados por pruebas unitarias usando simulaciones (`mocking`).
+El proyecto (tanto en el backend como en el frontend) se diseñó y programó manteniendo el paradigma de **TDD** y pruebas rigurosas. La red de ruteo HTTP hacia la API de Ollama y sus casos borde se encuentran respaldados por pruebas unitarias. Asimismo, el frontend al completo se testea emulando integraciones con la API usando RTL y Vitest, superando consistentemente el 80% de cobertura de código.
 
-Para ejecutar el set de tests con `pytest` y `httpx`:
+Para ejecutar los tests del backend con `pytest` y `httpx`:
 ```bash
 cd backend
 python -m pytest tests/ -v
+```
+
+Para probar el frontend y evaluar el reporte de cobertura de código usando `Vitest` y `v8`:
+```bash
+cd frontend
+npm run coverage
 ```
 
 ---

@@ -463,3 +463,174 @@ class TestGenerate:
             _ = [t async for t in client.generate("mistral:latest", "Hello")]
 
         mock_response.aclose.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Error paths for chat() — 400 → ValueError, non-400 → re-raise
+# ---------------------------------------------------------------------------
+
+
+class TestChatErrorPaths:
+    """Tests for OllamaClient.chat() HTTP error handling (lines 162-172, 176)."""
+
+    def _make_error_stream_ctx(self, status_code: int) -> MagicMock:
+        """Build a stream context whose raise_for_status raises HTTPStatusError."""
+        import httpx
+
+        mock_request = MagicMock()
+        mock_response_obj = MagicMock()
+        mock_response_obj.status_code = status_code
+        exc = httpx.HTTPStatusError(
+            f"{status_code}", request=mock_request, response=mock_response_obj
+        )
+
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock(side_effect=exc)
+        mock_response.aclose = AsyncMock()
+        mock_response.aiter_lines = MagicMock(return_value=_async_lines())
+
+        stream_ctx = MagicMock()
+        stream_ctx.__aenter__ = AsyncMock(return_value=mock_response)
+        stream_ctx.__aexit__ = AsyncMock(return_value=False)
+        return stream_ctx
+
+    async def test_400_converted_to_value_error(self):
+        """HTTP 400 from /api/chat must be converted to a friendly ValueError."""
+        client = OllamaClient(base_url="http://fake-ollama:11434")
+        stream_ctx = self._make_error_stream_ctx(400)
+
+        with patch("ollama_client.httpx.AsyncClient") as MockClient:
+            MockClient.return_value.__aenter__ = AsyncMock(
+                return_value=MockClient.return_value
+            )
+            MockClient.return_value.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value.stream = MagicMock(return_value=stream_ctx)
+
+            with pytest.raises(ValueError, match="embedding"):
+                async for _ in client.chat("embed-model", [{"role": "user", "content": "hi"}]):
+                    pass
+
+    async def test_non_400_http_error_reraised(self):
+        """HTTP errors other than 400 (e.g. 503) must be re-raised as-is."""
+        import httpx
+
+        client = OllamaClient(base_url="http://fake-ollama:11434")
+        stream_ctx = self._make_error_stream_ctx(503)
+
+        with patch("ollama_client.httpx.AsyncClient") as MockClient:
+            MockClient.return_value.__aenter__ = AsyncMock(
+                return_value=MockClient.return_value
+            )
+            MockClient.return_value.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value.stream = MagicMock(return_value=stream_ctx)
+
+            with pytest.raises(httpx.HTTPStatusError):
+                async for _ in client.chat("some-model", [{"role": "user", "content": "hi"}]):
+                    pass
+
+
+# ---------------------------------------------------------------------------
+# Error paths for generate() — 400 → ValueError, non-400 → re-raise
+# ---------------------------------------------------------------------------
+
+
+class TestGenerateErrorPaths:
+    """Tests for OllamaClient.generate() HTTP error handling (lines 216-224, 228)."""
+
+    def _make_error_stream_ctx(self, status_code: int) -> MagicMock:
+        """Build a stream context whose raise_for_status raises HTTPStatusError."""
+        import httpx
+
+        mock_request = MagicMock()
+        mock_response_obj = MagicMock()
+        mock_response_obj.status_code = status_code
+        exc = httpx.HTTPStatusError(
+            f"{status_code}", request=mock_request, response=mock_response_obj
+        )
+
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock(side_effect=exc)
+        mock_response.aclose = AsyncMock()
+        mock_response.aiter_lines = MagicMock(return_value=_async_lines())
+
+        stream_ctx = MagicMock()
+        stream_ctx.__aenter__ = AsyncMock(return_value=mock_response)
+        stream_ctx.__aexit__ = AsyncMock(return_value=False)
+        return stream_ctx
+
+    async def test_400_converted_to_value_error(self):
+        """HTTP 400 from /api/generate must be converted to a friendly ValueError."""
+        client = OllamaClient(base_url="http://fake-ollama:11434")
+        stream_ctx = self._make_error_stream_ctx(400)
+
+        with patch("ollama_client.httpx.AsyncClient") as MockClient:
+            MockClient.return_value.__aenter__ = AsyncMock(
+                return_value=MockClient.return_value
+            )
+            MockClient.return_value.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value.stream = MagicMock(return_value=stream_ctx)
+
+            with pytest.raises(ValueError, match="embedding"):
+                async for _ in client.generate("embed-model", "some prompt"):
+                    pass
+
+    async def test_non_400_http_error_reraised(self):
+        """HTTP errors other than 400 must be re-raised as-is from generate()."""
+        import httpx
+
+        client = OllamaClient(base_url="http://fake-ollama:11434")
+        stream_ctx = self._make_error_stream_ctx(503)
+
+        with patch("ollama_client.httpx.AsyncClient") as MockClient:
+            MockClient.return_value.__aenter__ = AsyncMock(
+                return_value=MockClient.return_value
+            )
+            MockClient.return_value.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value.stream = MagicMock(return_value=stream_ctx)
+
+            with pytest.raises(httpx.HTTPStatusError):
+                async for _ in client.generate("some-model", "some prompt"):
+                    pass
+
+
+# ---------------------------------------------------------------------------
+# OllamaClient constructor — base_url stripping
+# ---------------------------------------------------------------------------
+
+
+class TestOllamaClientConstructor:
+    """Tests for OllamaClient.__init__() base_url normalisation."""
+
+    def test_strips_trailing_slash(self):
+        """Trailing slashes on base_url must be stripped to avoid double slashes."""
+        client = OllamaClient(base_url="http://localhost:11434/")
+        assert client.base_url == "http://localhost:11434"
+
+    def test_default_base_url(self):
+        """Default base_url should be the standard Ollama port."""
+        client = OllamaClient()
+        assert "11434" in client.base_url
+
+
+# ---------------------------------------------------------------------------
+# deps.py — get_ollama_client
+# ---------------------------------------------------------------------------
+
+
+class TestGetOllamaClient:
+    """Tests for deps.get_ollama_client()."""
+
+    def test_returns_ollama_client_instance(self):
+        """get_ollama_client() must return a properly initialised OllamaClient."""
+        from deps import get_ollama_client
+
+        result = get_ollama_client()
+        assert isinstance(result, OllamaClient)
+
+    def test_returns_same_singleton(self):
+        """Multiple calls must return the same cached singleton instance."""
+        from deps import get_ollama_client
+
+        a = get_ollama_client()
+        b = get_ollama_client()
+        assert a is b

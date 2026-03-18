@@ -287,3 +287,42 @@ class TestDeleteModel:
 
         assert response.status_code == 404
         assert "detail" in response.json()
+
+
+    def test_returns_503_on_generic_exception(self):
+        """A non-HTTP exception during deletion must return HTTP 503."""
+
+        class GenericErrorDeleteClient(MockOllamaClient):
+            async def delete_model(self, name: str) -> None:
+                raise Exception("Connection timeout")
+
+        app.dependency_overrides[get_ollama_client] = lambda: GenericErrorDeleteClient()
+        response = TestClient(app).delete("/api/models/some-model:latest")
+
+        assert response.status_code == 503
+        assert "detail" in response.json()
+
+
+# ---------------------------------------------------------------------------
+# CancelledError during pull
+# ---------------------------------------------------------------------------
+
+
+class TestCancelledDuringPull:
+    """Tests for CancelledError handling in _pull_event_stream() (lines 88-91)."""
+
+    def test_cancelled_error_exits_silently(self):
+        """asyncio.CancelledError during pull must produce no crash and no error event."""
+        import asyncio
+
+        class CancelledPullClient(MockOllamaClient):
+            async def pull_model(self, name: str):
+                yield {"status": "pulling manifest"}
+                raise asyncio.CancelledError()
+
+        app.dependency_overrides[get_ollama_client] = lambda: CancelledPullClient()
+        response = TestClient(app).post("/api/models/pull", json={"name": "llama3:latest"})
+
+        assert response.status_code == 200
+        events = _parse_sse(response.text)
+        assert all("error" not in e for e in events)
