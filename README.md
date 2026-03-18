@@ -1,5 +1,7 @@
 # Ollama Dashboard
 
+![Backend Coverage](https://img.shields.io/badge/Backend_Coverage-Unknown-lightgrey)
+![Frontend Coverage](https://img.shields.io/badge/Frontend_Coverage-Unknown-lightgrey)
 A robust, full-stack administration panel and playground for managing local [Ollama](https://ollama.com/) AI models. Built with a focus on real-time streaming, asynchronous communication, and elegant error handling (SOLID).
 
 ## 🚀 Key Features
